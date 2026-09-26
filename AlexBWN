@@ -1,6 +1,6 @@
-task.wait(8)
+task.wait(5)
 
-print("[VINSENSE V6 ULTRA-SCALE] loaded")
+print("[VINSENSE V7 INSTANT-HOP] loaded")
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
@@ -533,10 +533,8 @@ local HOP_HISTORY_FILE = CONFIG_FOLDER .. "/ServerHistory.json"
 
 -- V6 ULTRA-SCALE
 -- Tuned for very high-CCU experiences where public server lists change constantly.
-local HOP_MAX_PAGES = 6
+local HOP_MAX_PAGES = 3
 local HOP_REQUEST_RETRIES = 5
-local HOP_TARGET_POOL_SIZE = 36
-local HOP_MIN_POOL_SIZE = 12
 local RECENT_SERVER_TTL = 240
 local FAILED_SERVER_TTL = 900
 local HOP_RETRY_DELAY = 0.70
@@ -736,7 +734,7 @@ end
 
 local function fetchHopServers(req, cursor)
     local url = "https://games.roblox.com/v1/games/" .. tostring(PLACE_ID)
-        .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
+        .. "/servers/Public?excludeFullGames=true&limit=100"
 
     if cursor and cursor ~= "" then
         url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
@@ -823,60 +821,24 @@ local function isUsableServer(server)
     return true
 end
 
-local function candidateScore(server)
-    local players = tonumber(server.playing) or math.huge
-    local ping = tonumber(server.ping) or 9999
-    local recentPenalty = isRecentServer(server.id) and 100000 or 0
-
-    -- In giant experiences, 1-player servers churn especially hard.
-    -- Keep them usable, but slightly prefer 2+ player low-pop servers
-    -- when the difference is tiny.
-    local onePlayerPenalty = players == 1 and 35 or 0
-
-    return recentPenalty + (players * 1000) + onePlayerPenalty + math.min(ping, 9999)
-end
-
-local function addCandidate(candidateMap, server)
+local function addCandidate(candidateList, seenIds, server)
     if not isUsableServer(server) then
-        return
+        return false
     end
 
-    local existing = candidateMap[server.id]
-    if not existing or candidateScore(server) < candidateScore(existing) then
-        candidateMap[server.id] = server
-    end
-end
-
-local function buildCandidateList(candidateMap)
-    local list = {}
-
-    for _, server in pairs(candidateMap) do
-        table.insert(list, server)
+    if seenIds[server.id] then
+        return false
     end
 
-    table.sort(list, function(a, b)
-        local scoreA = candidateScore(a)
-        local scoreB = candidateScore(b)
-
-        if scoreA == scoreB then
-            return tostring(a.id) < tostring(b.id)
-        end
-
-        return scoreA < scoreB
-    end)
-
-    if #list > HOP_TARGET_POOL_SIZE then
-        for index = #list, HOP_TARGET_POOL_SIZE + 1, -1 do
-            table.remove(list, index)
-        end
-    end
-
-    return list
+    seenIds[server.id] = true
+    table.insert(candidateList, server)
+    return true
 end
 
 local function scanCandidatePool(req)
     local cursor = nil
-    local candidateMap = {}
+    local candidates = {}
+    local seenIds = {}
     local pagesRead = 0
 
     for page = 1, HOP_MAX_PAGES do
@@ -892,27 +854,19 @@ local function scanCandidatePool(req)
             if page == 1 then
                 return {}, 0, errorReason
             end
-
             break
         end
 
         pagesRead = page
 
         for _, server in ipairs(data.data) do
-            addCandidate(candidateMap, server)
-        end
+            addCandidate(candidates, seenIds, server)
 
-        local candidateCount = tableEntryCount(candidateMap)
-
-        -- Because results are ascending, once we already have a healthy pool
-        -- of low-pop targets, extra pagination only increases stale-cursor and
-        -- rate-limit risk in 1M+ CCU experiences.
-        if candidateCount >= HOP_TARGET_POOL_SIZE then
-            break
-        end
-
-        if page >= 2 and candidateCount >= HOP_MIN_POOL_SIZE then
-            break
+            -- V7: no population ranking.
+            -- The moment we have a joinable target, stop scanning.
+            if #candidates >= 1 then
+                return candidates, pagesRead, nil
+            end
         end
 
         local nextCursor = data.nextPageCursor
@@ -923,7 +877,7 @@ local function scanCandidatePool(req)
         cursor = nextCursor
     end
 
-    return buildCandidateList(candidateMap), pagesRead, nil
+    return candidates, pagesRead, nil
 end
 
 local serverHop
@@ -1046,7 +1000,7 @@ tryNextCandidate = function()
     pendingServerId = nil
     state.IsHopping = false
     clearActivePool()
-    queueHopRetry("Refreshing low-population server pool...", 0.55)
+    queueHopRetry("Refreshing available servers...", 0.55)
 end
 
 serverHop = function()
@@ -1068,7 +1022,7 @@ serverHop = function()
     pendingServerId = nil
     clearActivePool()
 
-    setStatus("Scanning", "Building a stable low-population pool...", COLORS.Danger)
+    setStatus("Scanning", "Finding the first available server...", COLORS.Danger)
 
     task.spawn(function()
         local pool = nil
@@ -1090,7 +1044,7 @@ serverHop = function()
             if errorReason == "request_failed" or pagesRead == 0 then
                 queueHopRetry("Server API is busy; backing off...", 1.10)
             else
-                queueHopRetry("No stable target yet; refreshing...", 0.80)
+                queueHopRetry("No available target yet; refreshing...", 0.80)
             end
 
             return
